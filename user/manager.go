@@ -588,8 +588,8 @@ func NewManager(config *Config) (*Manager, error) {
 	if !util.FileExists(parentDir) {
 		return nil, fmt.Errorf("user database directory %s does not exist or is not accessible", parentDir)
 	}
-	// Open DB and run setup queries
-	db, err := sql.Open("sqlite3", config.Filename)
+	// Open DB with OpenTelemetry instrumentation and run setup queries
+	db, err := util.OpenInstrumentedDB("sqlite3", config.Filename)
 	if err != nil {
 		return nil, err
 	}

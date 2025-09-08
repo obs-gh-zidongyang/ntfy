@@ -30,6 +30,7 @@ import (
 	"github.com/emersion/go-smtp"
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v2"
 	"heckel.io/ntfy/v2/log"
@@ -283,17 +284,21 @@ func (s *Server) Run() error {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
+
+	// Wrap the mux with OpenTelemetry HTTP instrumentation
+	instrumentedHandler := otelhttp.NewHandler(mux, "ntfy-server")
+
 	errChan := make(chan error)
 	s.mu.Lock()
 	s.closeChan = make(chan bool)
 	if s.config.ListenHTTP != "" {
-		s.httpServer = &http.Server{Addr: s.config.ListenHTTP, Handler: mux}
+		s.httpServer = &http.Server{Addr: s.config.ListenHTTP, Handler: instrumentedHandler}
 		go func() {
 			errChan <- s.httpServer.ListenAndServe()
 		}()
 	}
 	if s.config.ListenHTTPS != "" {
-		s.httpsServer = &http.Server{Addr: s.config.ListenHTTPS, Handler: mux}
+		s.httpsServer = &http.Server{Addr: s.config.ListenHTTPS, Handler: instrumentedHandler}
 		go func() {
 			errChan <- s.httpsServer.ListenAndServeTLS(s.config.CertFile, s.config.KeyFile)
 		}()
@@ -318,7 +323,7 @@ func (s *Server) Run() error {
 				}
 			}
 			s.mu.Unlock()
-			httpServer := &http.Server{Handler: mux}
+			httpServer := &http.Server{Handler: instrumentedHandler}
 			errChan <- httpServer.Serve(s.unixListener)
 		}()
 	}
@@ -395,13 +400,13 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleError(w, r, v, err)
 		return
 	}
-	ev := logvr(v, r)
+	ev := logvr(v, r).WithContext(r.Context())
 	if ev.IsTrace() {
 		ev.Field("http_request", renderHTTPRequest(r)).Trace("HTTP request started")
 	} else if logvr(v, r).IsDebug() {
 		ev.Debug("HTTP request started")
 	}
-	logvr(v, r).
+	logvr(v, r).WithContext(r.Context()).
 		Timing(func() {
 			if err := s.handleInternal(w, r, v); err != nil {
 				s.handleError(w, r, v, err)
@@ -939,9 +944,7 @@ func (s *Server) forwardPollRequest(v *visitor, m *message) {
 	if s.config.UpstreamAccessToken != "" {
 		req.Header.Set("Authorization", util.BearerAuth(s.config.UpstreamAccessToken))
 	}
-	var httpClient = &http.Client{
-		Timeout: time.Second * 10,
-	}
+	var httpClient = util.NewInstrumentedHTTPClient(time.Second * 10)
 	response, err := httpClient.Do(req)
 	if err != nil {
 		logvm(v, m).Err(err).Warn("Unable to publish poll request")

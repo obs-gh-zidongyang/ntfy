@@ -1,6 +1,7 @@
 package log
 
 import (
+	"context"
 	"io"
 	"log"
 	"os"
@@ -91,6 +92,43 @@ func Time(time time.Time) *Event {
 // Timing runs f and records the time if took to execute it in "time_taken_ms"
 func Timing(f func()) *Event {
 	return newEvent().Timing(f)
+}
+
+// WithContext creates a new log event and adds trace/span IDs from the context
+func WithContext(ctx context.Context) *Event {
+	return newEvent().WithContext(ctx)
+}
+
+// Context-aware logging functions that automatically include trace correlation
+
+// FatalCtx prints the given message with trace context, and exits the program
+func FatalCtx(ctx context.Context, message string, v ...any) {
+	newEvent().WithContext(ctx).Fatal(message, v...)
+}
+
+// ErrorCtx prints the given message with trace context, if the current log level is ERROR or lower
+func ErrorCtx(ctx context.Context, message string, v ...any) {
+	newEvent().WithContext(ctx).Error(message, v...)
+}
+
+// WarnCtx prints the given message with trace context, if the current log level is WARN or lower
+func WarnCtx(ctx context.Context, message string, v ...any) {
+	newEvent().WithContext(ctx).Warn(message, v...)
+}
+
+// InfoCtx prints the given message with trace context, if the current log level is INFO or lower
+func InfoCtx(ctx context.Context, message string, v ...any) {
+	newEvent().WithContext(ctx).Info(message, v...)
+}
+
+// DebugCtx prints the given message with trace context, if the current log level is DEBUG or lower
+func DebugCtx(ctx context.Context, message string, v ...any) {
+	newEvent().WithContext(ctx).Debug(message, v...)
+}
+
+// TraceCtx prints the given message with trace context, if the current log level is TRACE
+func TraceCtx(ctx context.Context, message string, v ...any) {
+	newEvent().WithContext(ctx).Trace(message, v...)
 }
 
 // CurrentLevel returns the current log level

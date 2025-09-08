@@ -33,7 +33,7 @@ ADD ./web ./web
 RUN make web-build
 
 # cli & server
-ADD go.mod go.sum main.go ./
+ADD go.mod go.sum main.go otel.go ./
 ADD ./client ./client
 ADD ./cmd ./cmd
 ADD ./log ./log
