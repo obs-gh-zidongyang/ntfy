@@ -15,6 +15,10 @@ var (
 )
 
 func main() {
+	// Initialize OpenTelemetry instrumentation
+	shutdown := setupInstrumentation("ntfy")
+	defer shutdown()
+
 	cli.AppHelpTemplate += fmt.Sprintf(`
 Try 'ntfy COMMAND --help' or https://ntfy.sh/docs/ for more information.
 

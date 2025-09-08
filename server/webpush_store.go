@@ -96,7 +96,7 @@ type webPushStore struct {
 }
 
 func newWebPushStore(filename, startupQueries string) (*webPushStore, error) {
-	db, err := sql.Open("sqlite3", filename)
+	db, err := util.OpenInstrumentedDB("sqlite3", filename)
 	if err != nil {
 		return nil, err
 	}

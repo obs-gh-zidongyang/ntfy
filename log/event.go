@@ -1,6 +1,7 @@
 package log
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"heckel.io/ntfy/v2/util"
@@ -9,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -16,6 +19,8 @@ const (
 	fieldError     = "error"
 	fieldTimeTaken = "time_taken_ms"
 	fieldExitCode  = "exit_code"
+	fieldTraceID   = "trace_id"
+	fieldSpanID    = "span_id"
 	tagStdLog      = "stdlog"
 )
 
@@ -79,6 +84,20 @@ func (e *Event) Tag(tag string) *Event {
 // Time sets the time field
 func (e *Event) Time(t time.Time) *Event {
 	e.time = t
+	return e
+}
+
+// WithContext adds trace and span IDs from the given context to the log event
+func (e *Event) WithContext(ctx context.Context) *Event {
+	if ctx == nil {
+		return e
+	}
+
+	spanCtx := trace.SpanContextFromContext(ctx)
+	if spanCtx.IsValid() {
+		e.Field(fieldTraceID, spanCtx.TraceID().String())
+		e.Field(fieldSpanID, spanCtx.SpanID().String())
+	}
 	return e
 }
 

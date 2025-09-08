@@ -294,8 +294,8 @@ func newSqliteCache(filename, startupQueries string, cacheDuration time.Duration
 	if !util.FileExists(parentDir) {
 		return nil, fmt.Errorf("cache database directory %s does not exist or is not accessible", parentDir)
 	}
-	// Open database
-	db, err := sql.Open("sqlite3", filename)
+	// Open database with OpenTelemetry instrumentation
+	db, err := util.OpenInstrumentedDB("sqlite3", filename)
 	if err != nil {
 		return nil, err
 	}
