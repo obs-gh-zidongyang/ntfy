@@ -2,11 +2,15 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/xml"
 	"fmt"
 	"heckel.io/ntfy/v2/log"
+	"heckel.io/ntfy/v2/otel"
 	"heckel.io/ntfy/v2/user"
 	"heckel.io/ntfy/v2/util"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"io"
 	"net/http"
 	"net/url"
@@ -61,23 +65,64 @@ func (s *Server) convertPhoneNumber(u *user.User, phoneNumber string) (string, *
 // callPhone calls the Twilio API to make a phone call to the given phone number, using the given message.
 // Failures will be logged, but not returned to the caller.
 func (s *Server) callPhone(v *visitor, r *http.Request, m *message, to string) {
+	tracer := otel.GetOtelTracer()
+	if tracer == nil {
+		tracer = trace.NewNoopTracerProvider().Tracer("ntfy")
+	}
+	ctx, span := tracer.Start(context.Background(), "server.callPhone")
+	defer span.End()
+
+	span.SetAttributes(
+		attribute.String("service", "twilio"),
+		attribute.String("message.id", m.ID),
+		attribute.String("topic.name", m.Topic),
+		attribute.String("phone.to", to),
+	)
+
 	u, sender := v.User(), m.Sender.String()
 	if u != nil {
 		sender = u.Name
+		span.SetAttributes(attribute.String("user.name", u.Name))
 	}
+
 	body := fmt.Sprintf(twilioCallFormat, xmlEscapeText(m.Topic), xmlEscapeText(m.Message), xmlEscapeText(sender))
 	data := url.Values{}
 	data.Set("From", s.config.TwilioPhoneNumber)
 	data.Set("To", to)
 	data.Set("Twiml", body)
+
 	ev := logvrm(v, r, m).Tag(tagTwilio).Field("twilio_to", to).FieldIf("twilio_body", body, log.TraceLevel).Debug("Sending Twilio request")
+	logWithOtel(ctx, "debug", "Making phone call via Twilio", map[string]interface{}{
+		"message_id": m.ID,
+		"topic": m.Topic,
+		"phone_to": to,
+		"service": "twilio",
+	})
+
 	response, err := s.callPhoneInternal(data)
 	if err != nil {
+		span.RecordError(err)
+		span.SetAttributes(attribute.String("error.type", "twilio_call_error"))
+		recordCallMade(ctx, false)
 		ev.Field("twilio_response", response).Err(err).Warn("Error sending Twilio request")
+		logWithOtel(ctx, "warn", "Failed to make phone call", map[string]interface{}{
+			"message_id": m.ID,
+			"topic": m.Topic,
+			"phone_to": to,
+			"error": err.Error(),
+		})
 		minc(metricCallsMadeFailure)
 		return
 	}
+
+	span.SetAttributes(attribute.Bool("twilio.success", true))
+	recordCallMade(ctx, true)
 	ev.FieldIf("twilio_response", response, log.TraceLevel).Debug("Received successful Twilio response")
+	logWithOtel(ctx, "debug", "Successfully made phone call", map[string]interface{}{
+		"message_id": m.ID,
+		"topic": m.Topic,
+		"phone_to": to,
+	})
 	minc(metricCallsMadeSuccess)
 }
 

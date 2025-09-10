@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -339,11 +340,15 @@ func createMemoryFilename() string {
 // AddMessage stores a message to the message cache synchronously, or queues it to be stored at a later date asyncronously.
 // The message is queued only if "batchSize" or "batchTimeout" are passed to the constructor.
 func (c *messageCache) AddMessage(m *message) error {
+	ctx := context.Background()
 	if c.queue != nil {
 		c.queue.Enqueue(m)
+		recordCacheOperation(ctx, "enqueue", true)
 		return nil
 	}
-	return c.addMessages([]*message{m})
+	err := c.addMessages([]*message{m})
+	recordCacheOperation(ctx, "add_message", err == nil)
+	return err
 }
 
 // addMessages synchronously stores a match of messages. If the database is locked, the transaction waits until
@@ -432,14 +437,24 @@ func (c *messageCache) addMessages(ms []*message) error {
 }
 
 func (c *messageCache) Messages(topic string, since sinceMarker, scheduled bool) ([]*message, error) {
+	ctx := context.Background()
 	if since.IsNone() {
+		recordCacheOperation(ctx, "messages_none", true)
 		return make([]*message, 0), nil
-	} else if since.IsLatest() {
-		return c.messagesLatest(topic)
-	} else if since.IsID() {
-		return c.messagesSinceID(topic, since, scheduled)
 	}
-	return c.messagesSinceTime(topic, since, scheduled)
+
+	var messages []*message
+	var err error
+	if since.IsLatest() {
+		messages, err = c.messagesLatest(topic)
+	} else if since.IsID() {
+		messages, err = c.messagesSinceID(topic, since, scheduled)
+	} else {
+		messages, err = c.messagesSinceTime(topic, since, scheduled)
+	}
+
+	recordCacheOperation(ctx, "messages_query", err == nil)
+	return messages, err
 }
 
 func (c *messageCache) messagesSinceTime(topic string, since sinceMarker, scheduled bool) ([]*message, error) {
@@ -579,19 +594,24 @@ func (c *messageCache) Topics() (map[string]*topic, error) {
 }
 
 func (c *messageCache) DeleteMessages(ids ...string) error {
+	ctx := context.Background()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	tx, err := c.db.Begin()
 	if err != nil {
+		recordCacheOperation(ctx, "delete_messages", false)
 		return err
 	}
 	defer tx.Rollback()
 	for _, id := range ids {
 		if _, err := tx.Exec(deleteMessageQuery, id); err != nil {
+			recordCacheOperation(ctx, "delete_messages", false)
 			return err
 		}
 	}
-	return tx.Commit()
+	err = tx.Commit()
+	recordCacheOperation(ctx, "delete_messages", err == nil)
+	return err
 }
 
 func (c *messageCache) ExpireMessages(topics ...string) error {

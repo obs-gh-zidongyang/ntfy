@@ -31,9 +31,12 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v2"
 	"heckel.io/ntfy/v2/log"
+	"heckel.io/ntfy/v2/otel"
 	"heckel.io/ntfy/v2/payments"
 	"heckel.io/ntfy/v2/user"
 	"heckel.io/ntfy/v2/util"
@@ -158,6 +161,44 @@ const (
 	wsReadLimit  = 64 // We only ever receive PINGs
 	wsPongWait   = 15 * time.Second
 )
+
+// getTracer returns the OpenTelemetry tracer for the server
+func getTracer() trace.Tracer {
+	tracer := otel.GetOtelTracer()
+	if tracer == nil {
+		// Return a no-op tracer if OpenTelemetry is not initialized (e.g., during tests)
+		return trace.NewNoopTracerProvider().Tracer("ntfy")
+	}
+	return tracer
+}
+
+// logWithOtel logs a message using both the traditional logger and OpenTelemetry logger
+func logWithOtel(ctx context.Context, level string, message string, fields map[string]interface{}) {
+	// Use OpenTelemetry structured logger for better observability
+	otelLogger := otel.GetOtelLogger()
+	if otelLogger == nil {
+		return // OpenTelemetry not initialized (e.g., during tests)
+	}
+
+	// Convert fields to slog attributes
+	args := make([]interface{}, 0, len(fields)*2)
+	for k, v := range fields {
+		args = append(args, k, v)
+	}
+
+	switch level {
+	case "error":
+		otelLogger.ErrorContext(ctx, message, args...)
+	case "warn":
+		otelLogger.WarnContext(ctx, message, args...)
+	case "info":
+		otelLogger.InfoContext(ctx, message, args...)
+	case "debug":
+		otelLogger.DebugContext(ctx, message, args...)
+	default:
+		otelLogger.InfoContext(ctx, message, args...)
+	}
+}
 
 // New instantiates a new Server. It creates the cache and adds a Firebase
 // subscriber (if configured).
@@ -761,41 +802,85 @@ func (s *Server) handleMatrixDiscovery(w http.ResponseWriter) error {
 }
 
 func (s *Server) handlePublishInternal(r *http.Request, v *visitor) (*message, error) {
+	ctx, span := getTracer().Start(r.Context(), "server.handlePublishInternal")
+	defer span.End()
+
 	start := time.Now()
 	t, err := fromContext[*topic](r, contextTopic)
 	if err != nil {
+		span.RecordError(err)
+		span.SetAttributes(attribute.String("error.type", "context_error"))
 		return nil, err
+	}
+
+	// Add span attributes for tracing
+	span.SetAttributes(
+		attribute.String("topic.name", t.ID),
+		attribute.String("http.method", r.Method),
+		attribute.String("http.url", r.URL.String()),
+	)
+	if v.User() != nil {
+		span.SetAttributes(attribute.String("user.id", v.User().Name))
 	}
 	vrate, err := fromContext[*visitor](r, contextRateVisitor)
 	if err != nil {
+		span.RecordError(err)
+		span.SetAttributes(attribute.String("error.type", "rate_visitor_context_error"))
 		return nil, err
 	}
 	body, err := util.Peek(r.Body, s.config.MessageSizeLimit)
 	if err != nil {
+		span.RecordError(err)
+		span.SetAttributes(attribute.String("error.type", "body_read_error"))
 		return nil, err
 	}
 	m := newDefaultMessage(t.ID, "")
 	cache, firebase, email, call, template, unifiedpush, e := s.parsePublishParams(r, m)
 	if e != nil {
+		span.RecordError(e)
+		span.SetAttributes(attribute.String("error.type", "parse_params_error"))
 		return nil, e.With(t)
 	}
+
+	// Add message attributes to span
+	span.SetAttributes(
+		attribute.Bool("message.cache", cache),
+		attribute.Bool("message.firebase", firebase),
+		attribute.Bool("message.unifiedpush", unifiedpush),
+		attribute.String("message.email", email),
+		attribute.String("message.call", call),
+	)
 	if unifiedpush && s.config.VisitorSubscriberRateLimiting && t.RateVisitor() == nil {
 		// UnifiedPush clients must subscribe before publishing to allow proper subscriber-based rate limiting.
 		// The 5xx response is because some app servers (in particular Mastodon) will remove
 		// the subscription as invalid if any 400-499 code (except 429/408) is returned.
 		// See https://github.com/mastodon/mastodon/blob/730bb3e211a84a2f30e3e2bbeae3f77149824a68/app/workers/web/push_notification_worker.rb#L35-L46
-		return nil, errHTTPInsufficientStorageUnifiedPush.With(t)
+		err := errHTTPInsufficientStorageUnifiedPush.With(t)
+		span.RecordError(err)
+		span.SetAttributes(attribute.String("error.type", "unifiedpush_rate_limit"))
+		return nil, err
 	} else if !util.ContainsIP(s.config.VisitorRequestExemptPrefixes, v.ip) && !vrate.MessageAllowed() {
-		return nil, errHTTPTooManyRequestsLimitMessages.With(t)
+		err := errHTTPTooManyRequestsLimitMessages.With(t)
+		span.RecordError(err)
+		span.SetAttributes(attribute.String("error.type", "message_rate_limit"))
+		return nil, err
 	} else if email != "" && !vrate.EmailAllowed() {
-		return nil, errHTTPTooManyRequestsLimitEmails.With(t)
+		err := errHTTPTooManyRequestsLimitEmails.With(t)
+		span.RecordError(err)
+		span.SetAttributes(attribute.String("error.type", "email_rate_limit"))
+		return nil, err
 	} else if call != "" {
 		var httpErr *errHTTP
 		call, httpErr = s.convertPhoneNumber(v.User(), call)
 		if httpErr != nil {
+			span.RecordError(httpErr)
+			span.SetAttributes(attribute.String("error.type", "phone_conversion_error"))
 			return nil, httpErr.With(t)
 		} else if !vrate.CallAllowed() {
-			return nil, errHTTPTooManyRequestsLimitCalls.With(t)
+			err := errHTTPTooManyRequestsLimitCalls.With(t)
+			span.RecordError(err)
+			span.SetAttributes(attribute.String("error.type", "call_rate_limit"))
+			return nil, err
 		}
 	}
 	if m.PollID != "" {
@@ -807,6 +892,8 @@ func (s *Server) handlePublishInternal(r *http.Request, v *visitor) (*message, e
 		m.Expires = time.Unix(m.Time, 0).Add(v.Limits().MessageExpiryDuration).Unix()
 	}
 	if err := s.handlePublishBody(r, v, m, body, template, unifiedpush); err != nil {
+		span.RecordError(err)
+		span.SetAttributes(attribute.String("error.type", "body_handling_error"))
 		return nil, err
 	}
 	if m.Message == "" {
@@ -830,6 +917,8 @@ func (s *Server) handlePublishInternal(r *http.Request, v *visitor) (*message, e
 	}
 	if !delayed {
 		if err := t.Publish(v, m); err != nil {
+			span.RecordError(err)
+			span.SetAttributes(attribute.String("error.type", "topic_publish_error"))
 			return nil, err
 		}
 		if s.firebaseClient != nil && firebase {
@@ -853,6 +942,8 @@ func (s *Server) handlePublishInternal(r *http.Request, v *visitor) (*message, e
 	if cache {
 		logvrm(v, r, m).Tag(tagPublish).Debug("Adding message to cache")
 		if err := s.messageCache.AddMessage(m); err != nil {
+			span.RecordError(err)
+			span.SetAttributes(attribute.String("error.type", "cache_add_error"))
 			return nil, err
 		}
 	}
@@ -866,32 +957,80 @@ func (s *Server) handlePublishInternal(r *http.Request, v *visitor) (*message, e
 	if unifiedpush {
 		minc(metricUnifiedPushPublishedSuccess)
 	}
-	mset(metricMessagePublishDurationMillis, time.Since(start).Milliseconds())
+
+	// Record success metrics in span
+	duration := time.Since(start)
+	span.SetAttributes(
+		attribute.Int64("message.publish_duration_ms", duration.Milliseconds()),
+		attribute.Bool("message.delayed", delayed),
+		attribute.String("message.id", m.ID),
+	)
+
+	// Record OpenTelemetry metrics
+	recordMessagePublished(ctx, true, t.ID, "")
+	recordMessagePublishLatency(ctx, duration.Milliseconds(), t.ID)
+
+	mset(metricMessagePublishDurationMillis, duration.Milliseconds())
 	return m, nil
 }
 
 func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request, v *visitor) error {
+	ctx, span := getTracer().Start(r.Context(), "server.handlePublish")
+	defer span.End()
+
+	// Update request context
+	r = r.WithContext(ctx)
+
 	m, err := s.handlePublishInternal(r, v)
 	if err != nil {
+		span.RecordError(err)
+		// Record failure in OpenTelemetry metrics
+		if t, tErr := fromContext[*topic](r, contextTopic); tErr == nil {
+			recordMessagePublished(ctx, false, t.ID, "http")
+		}
 		minc(metricMessagesPublishedFailure)
 		return err
 	}
+
+	span.SetAttributes(
+		attribute.String("message.id", m.ID),
+		attribute.String("topic.name", m.Topic),
+	)
+
+	// Record success in OpenTelemetry metrics
+	recordMessagePublished(ctx, true, m.Topic, "http")
+
 	minc(metricMessagesPublishedSuccess)
 	return s.writeJSON(w, m)
 }
 
 func (s *Server) handlePublishMatrix(w http.ResponseWriter, r *http.Request, v *visitor) error {
+	ctx, span := getTracer().Start(r.Context(), "server.handlePublishMatrix")
+	defer span.End()
+
+	span.SetAttributes(attribute.String("protocol", "matrix"))
+
+	// Update request context
+	r = r.WithContext(ctx)
+
 	_, err := s.handlePublishInternal(r, v)
 	if err != nil {
+		span.RecordError(err)
+		// Record failure in OpenTelemetry metrics
+		if t, tErr := fromContext[*topic](r, contextTopic); tErr == nil {
+			recordMessagePublished(ctx, false, t.ID, "matrix")
+		}
 		minc(metricMessagesPublishedFailure)
 		minc(metricMatrixPublishedFailure)
 		if e, ok := err.(*errHTTP); ok && e.HTTPCode == errHTTPInsufficientStorageUnifiedPush.HTTPCode {
 			topic, err := fromContext[*topic](r, contextTopic)
 			if err != nil {
+				span.RecordError(err)
 				return err
 			}
 			pushKey, err := fromContext[string](r, contextMatrixPushKey)
 			if err != nil {
+				span.RecordError(err)
 				return err
 			}
 			if time.Since(topic.LastAccess()) > matrixRejectPushKeyForUnifiedPushTopicWithoutRateVisitorAfter {
@@ -900,32 +1039,106 @@ func (s *Server) handlePublishMatrix(w http.ResponseWriter, r *http.Request, v *
 		}
 		return err
 	}
+
+	// Record success in OpenTelemetry metrics
+	if t, tErr := fromContext[*topic](r, contextTopic); tErr == nil {
+		recordMessagePublished(ctx, true, t.ID, "matrix")
+	}
+
 	minc(metricMessagesPublishedSuccess)
 	minc(metricMatrixPublishedSuccess)
 	return writeMatrixSuccess(w)
 }
 
 func (s *Server) sendToFirebase(v *visitor, m *message) {
+	ctx, span := getTracer().Start(context.Background(), "server.sendToFirebase")
+	defer span.End()
+
+	span.SetAttributes(
+		attribute.String("service", "firebase"),
+		attribute.String("message.id", m.ID),
+		attribute.String("topic.name", m.Topic),
+	)
+
 	logvm(v, m).Tag(tagFirebase).Debug("Publishing to Firebase")
+	logWithOtel(ctx, "debug", "Publishing message to Firebase", map[string]interface{}{
+		"message_id": m.ID,
+		"topic": m.Topic,
+		"service": "firebase",
+	})
+
 	if err := s.firebaseClient.Send(v, m); err != nil {
+		span.RecordError(err)
+		span.SetAttributes(attribute.String("error.type", "firebase_send_error"))
+		recordFirebasePublished(ctx, false)
 		minc(metricFirebasePublishedFailure)
 		if errors.Is(err, errFirebaseTemporarilyBanned) {
+			span.SetAttributes(attribute.Bool("firebase.temporarily_banned", true))
 			logvm(v, m).Tag(tagFirebase).Err(err).Debug("Unable to publish to Firebase: %v", err.Error())
+			logWithOtel(ctx, "debug", "Firebase temporarily banned", map[string]interface{}{
+				"message_id": m.ID,
+				"topic": m.Topic,
+				"error": err.Error(),
+			})
 		} else {
 			logvm(v, m).Tag(tagFirebase).Err(err).Warn("Unable to publish to Firebase: %v", err.Error())
+			logWithOtel(ctx, "warn", "Failed to publish to Firebase", map[string]interface{}{
+				"message_id": m.ID,
+				"topic": m.Topic,
+				"error": err.Error(),
+			})
 		}
 		return
 	}
+	recordFirebasePublished(ctx, true)
 	minc(metricFirebasePublishedSuccess)
+	span.SetAttributes(attribute.Bool("firebase.success", true))
+	logWithOtel(ctx, "debug", "Successfully published to Firebase", map[string]interface{}{
+		"message_id": m.ID,
+		"topic": m.Topic,
+	})
 }
 
 func (s *Server) sendEmail(v *visitor, m *message, email string) {
+	ctx, span := getTracer().Start(context.Background(), "server.sendEmail")
+	defer span.End()
+
+	span.SetAttributes(
+		attribute.String("service", "email"),
+		attribute.String("message.id", m.ID),
+		attribute.String("topic.name", m.Topic),
+		attribute.String("email.recipient", email),
+	)
+
 	logvm(v, m).Tag(tagEmail).Field("email", email).Debug("Sending email to %s", email)
+	logWithOtel(ctx, "debug", "Sending email notification", map[string]interface{}{
+		"message_id": m.ID,
+		"topic": m.Topic,
+		"email": email,
+		"service": "email",
+	})
+
 	if err := s.smtpSender.Send(v, m, email); err != nil {
+		span.RecordError(err)
+		span.SetAttributes(attribute.String("error.type", "email_send_error"))
+		recordEmailSent(ctx, false)
 		logvm(v, m).Tag(tagEmail).Field("email", email).Err(err).Warn("Unable to send email to %s: %v", email, err.Error())
+		logWithOtel(ctx, "warn", "Failed to send email", map[string]interface{}{
+			"message_id": m.ID,
+			"topic": m.Topic,
+			"email": email,
+			"error": err.Error(),
+		})
 		minc(metricEmailsPublishedFailure)
 		return
 	}
+	recordEmailSent(ctx, true)
+	span.SetAttributes(attribute.Bool("email.success", true))
+	logWithOtel(ctx, "debug", "Successfully sent email", map[string]interface{}{
+		"message_id": m.ID,
+		"topic": m.Topic,
+		"email": email,
+	})
 	minc(metricEmailsPublishedSuccess)
 }
 
@@ -1272,6 +1485,17 @@ func (s *Server) handleBodyAsAttachment(r *http.Request, v *visitor, m *message,
 }
 
 func (s *Server) handleSubscribeJSON(w http.ResponseWriter, r *http.Request, v *visitor) error {
+	ctx, span := getTracer().Start(r.Context(), "server.handleSubscribeJSON")
+	defer span.End()
+
+	span.SetAttributes(
+		attribute.String("subscription.format", "json"),
+		attribute.String("content_type", "application/x-ndjson"),
+	)
+
+	// Update request context
+	r = r.WithContext(ctx)
+
 	encoder := func(msg *message) (string, error) {
 		var buf bytes.Buffer
 		if err := json.NewEncoder(&buf).Encode(&msg); err != nil {
@@ -1283,6 +1507,17 @@ func (s *Server) handleSubscribeJSON(w http.ResponseWriter, r *http.Request, v *
 }
 
 func (s *Server) handleSubscribeSSE(w http.ResponseWriter, r *http.Request, v *visitor) error {
+	ctx, span := getTracer().Start(r.Context(), "server.handleSubscribeSSE")
+	defer span.End()
+
+	span.SetAttributes(
+		attribute.String("subscription.format", "sse"),
+		attribute.String("content_type", "text/event-stream"),
+	)
+
+	// Update request context
+	r = r.WithContext(ctx)
+
 	encoder := func(msg *message) (string, error) {
 		var buf bytes.Buffer
 		if err := json.NewEncoder(&buf).Encode(&msg); err != nil {
@@ -1400,11 +1635,25 @@ func (s *Server) handleSubscribeHTTP(w http.ResponseWriter, r *http.Request, v *
 }
 
 func (s *Server) handleSubscribeWS(w http.ResponseWriter, r *http.Request, v *visitor) error {
+	_, span := getTracer().Start(r.Context(), "server.handleSubscribeWS")
+	defer span.End()
+
+	span.SetAttributes(
+		attribute.String("subscription.format", "websocket"),
+		attribute.String("protocol", "websocket"),
+	)
+
 	if strings.ToLower(r.Header.Get("Upgrade")) != "websocket" {
-		return errHTTPBadRequestWebSocketsUpgradeHeaderMissing
+		err := errHTTPBadRequestWebSocketsUpgradeHeaderMissing
+		span.RecordError(err)
+		span.SetAttributes(attribute.String("error.type", "websocket_upgrade_missing"))
+		return err
 	}
 	if !v.SubscriptionAllowed() {
-		return errHTTPTooManyRequestsLimitSubscriptions
+		err := errHTTPTooManyRequestsLimitSubscriptions
+		span.RecordError(err)
+		span.SetAttributes(attribute.String("error.type", "subscription_rate_limit"))
+		return err
 	}
 	defer v.RemoveSubscription()
 	logvr(v, r).Tag(tagWebsocket).Debug("WebSocket connection opened")
@@ -2014,10 +2263,20 @@ func (s *Server) authorizeTopic(next handleFunc, perm user.Permission) handleFun
 // This function will ALWAYS return a visitor, even if an error occurs (e.g. unauthorized), so
 // that subsequent logging calls still have a visitor context.
 func (s *Server) maybeAuthenticate(r *http.Request) (*visitor, error) {
+	_, span := getTracer().Start(r.Context(), "server.maybeAuthenticate")
+	defer span.End()
+
 	// Read the "Authorization" header value and exit out early if it's not set
 	ip := extractIPAddress(r, s.config.BehindProxy, s.config.ProxyForwardedHeader, s.config.ProxyTrustedPrefixes)
 	vip := s.visitor(ip, nil)
+
+	span.SetAttributes(
+		attribute.String("visitor.ip", ip.String()),
+		attribute.Bool("user_manager.enabled", s.userManager != nil),
+	)
+
 	if s.userManager == nil {
+		span.SetAttributes(attribute.String("auth.result", "no_user_manager"))
 		return vip, nil
 	}
 	header, err := readAuthHeader(r)

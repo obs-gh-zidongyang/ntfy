@@ -3,6 +3,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,7 +11,10 @@ import (
 	"strings"
 
 	"github.com/SherClockHolmes/webpush-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"heckel.io/ntfy/v2/log"
+	"heckel.io/ntfy/v2/otel"
 	"heckel.io/ntfy/v2/user"
 )
 
@@ -83,22 +87,73 @@ func (s *Server) handleWebPushDelete(w http.ResponseWriter, r *http.Request, _ *
 }
 
 func (s *Server) publishToWebPushEndpoints(v *visitor, m *message) {
+	tracer := otel.GetOtelTracer()
+	if tracer == nil {
+		tracer = trace.NewNoopTracerProvider().Tracer("ntfy")
+	}
+	ctx, span := tracer.Start(context.Background(), "server.publishToWebPushEndpoints")
+	defer span.End()
+
+	span.SetAttributes(
+		attribute.String("service", "webpush"),
+		attribute.String("message.id", m.ID),
+		attribute.String("topic.name", m.Topic),
+	)
+
 	subscriptions, err := s.webPush.SubscriptionsForTopic(m.Topic)
 	if err != nil {
+		span.RecordError(err)
+		span.SetAttributes(attribute.String("error.type", "webpush_subscriptions_error"))
 		logvm(v, m).Err(err).With(v, m).Warn("Unable to publish web push messages")
+		logWithOtel(ctx, "warn", "Failed to get WebPush subscriptions", map[string]interface{}{
+			"message_id": m.ID,
+			"topic": m.Topic,
+			"error": err.Error(),
+		})
 		return
 	}
+
+	span.SetAttributes(attribute.Int("webpush.subscription_count", len(subscriptions)))
 	log.Tag(tagWebPush).With(v, m).Debug("Publishing web push message to %d subscribers", len(subscriptions))
+	logWithOtel(ctx, "debug", "Publishing WebPush notifications", map[string]interface{}{
+		"message_id": m.ID,
+		"topic": m.Topic,
+		"subscription_count": len(subscriptions),
+	})
+
 	payload, err := json.Marshal(newWebPushPayload(fmt.Sprintf("%s/%s", s.config.BaseURL, m.Topic), m))
 	if err != nil {
+		span.RecordError(err)
+		span.SetAttributes(attribute.String("error.type", "webpush_payload_marshal_error"))
 		log.Tag(tagWebPush).Err(err).With(v, m).Warn("Unable to marshal expiring payload")
+		logWithOtel(ctx, "warn", "Failed to marshal WebPush payload", map[string]interface{}{
+			"message_id": m.ID,
+			"topic": m.Topic,
+			"error": err.Error(),
+		})
 		return
 	}
+
+	successCount := 0
 	for _, subscription := range subscriptions {
 		if err := s.sendWebPushNotification(subscription, payload, v, m); err != nil {
 			log.Tag(tagWebPush).Err(err).With(v, m, subscription).Warn("Unable to publish web push message")
+		} else {
+			successCount++
 		}
 	}
+
+	span.SetAttributes(
+		attribute.Int("webpush.success_count", successCount),
+		attribute.Int("webpush.failure_count", len(subscriptions)-successCount),
+	)
+
+	logWithOtel(ctx, "debug", "Completed WebPush notifications", map[string]interface{}{
+		"message_id": m.ID,
+		"topic": m.Topic,
+		"success_count": successCount,
+		"total_count": len(subscriptions),
+	})
 }
 
 func (s *Server) pruneAndNotifyWebPushSubscriptions() {
