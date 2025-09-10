@@ -1,4 +1,5 @@
 MAKEFLAGS := --jobs=1
+SHELL := /bin/bash
 PYTHON := python3
 PIP := pip3
 VERSION := $(shell git describe --tag)
