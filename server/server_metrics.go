@@ -1,10 +1,15 @@
 package server
 
 import (
+	"context"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"heckel.io/ntfy/v2/otel"
 )
 
 var (
+	// Prometheus metrics (existing)
 	metricMessagesPublishedSuccess     prometheus.Counter
 	metricMessagesPublishedFailure     prometheus.Counter
 	metricMessagesCached               prometheus.Gauge
@@ -26,6 +31,16 @@ var (
 	metricTopics                       prometheus.Gauge
 	metricUsers                        prometheus.Gauge
 	metricHTTPRequests                 *prometheus.CounterVec
+
+	// OpenTelemetry metrics (new)
+	otelMessagesPublished     metric.Int64Counter
+	otelMessagePublishLatency metric.Int64Histogram
+	otelFirebasePublished     metric.Int64Counter
+	otelEmailsSent            metric.Int64Counter
+	otelCallsMade             metric.Int64Counter
+	otelSubscriptions         metric.Int64UpDownCounter
+	otelActiveConnections     metric.Int64UpDownCounter
+	otelCacheOperations       metric.Int64Counter
 )
 
 func initMetrics() {
@@ -92,6 +107,10 @@ func initMetrics() {
 	metricHTTPRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "ntfy_http_requests_total",
 	}, []string{"http_code", "ntfy_code", "http_method"})
+
+	// Initialize OpenTelemetry metrics
+	initOtelMetrics()
+
 	prometheus.MustRegister(
 		metricMessagesPublishedSuccess,
 		metricMessagesPublishedFailure,
@@ -117,6 +136,96 @@ func initMetrics() {
 	)
 }
 
+// initOtelMetrics initializes OpenTelemetry metrics
+func initOtelMetrics() {
+	meter := otel.GetOtelMeter()
+	if meter == nil {
+		return // OpenTelemetry not initialized
+	}
+
+	var err error
+
+	// Messages published counter
+	otelMessagesPublished, err = meter.Int64Counter(
+		"ntfy.messages.published",
+		metric.WithDescription("Total number of messages published"),
+		metric.WithUnit("1"),
+	)
+	if err != nil {
+		// Log error but don't fail
+	}
+
+	// Message publish latency histogram
+	otelMessagePublishLatency, err = meter.Int64Histogram(
+		"ntfy.message.publish.duration",
+		metric.WithDescription("Message publish duration"),
+		metric.WithUnit("ms"),
+	)
+	if err != nil {
+		// Log error but don't fail
+	}
+
+	// Firebase published counter
+	otelFirebasePublished, err = meter.Int64Counter(
+		"ntfy.firebase.published",
+		metric.WithDescription("Total number of Firebase notifications sent"),
+		metric.WithUnit("1"),
+	)
+	if err != nil {
+		// Log error but don't fail
+	}
+
+	// Emails sent counter
+	otelEmailsSent, err = meter.Int64Counter(
+		"ntfy.emails.sent",
+		metric.WithDescription("Total number of email notifications sent"),
+		metric.WithUnit("1"),
+	)
+	if err != nil {
+		// Log error but don't fail
+	}
+
+	// Calls made counter
+	otelCallsMade, err = meter.Int64Counter(
+		"ntfy.calls.made",
+		metric.WithDescription("Total number of phone calls made"),
+		metric.WithUnit("1"),
+	)
+	if err != nil {
+		// Log error but don't fail
+	}
+
+	// Active subscriptions gauge
+	otelSubscriptions, err = meter.Int64UpDownCounter(
+		"ntfy.subscriptions.active",
+		metric.WithDescription("Number of active subscriptions"),
+		metric.WithUnit("1"),
+	)
+	if err != nil {
+		// Log error but don't fail
+	}
+
+	// Active connections gauge
+	otelActiveConnections, err = meter.Int64UpDownCounter(
+		"ntfy.connections.active",
+		metric.WithDescription("Number of active connections"),
+		metric.WithUnit("1"),
+	)
+	if err != nil {
+		// Log error but don't fail
+	}
+
+	// Cache operations counter
+	otelCacheOperations, err = meter.Int64Counter(
+		"ntfy.cache.operations",
+		metric.WithDescription("Total number of cache operations"),
+		metric.WithUnit("1"),
+	)
+	if err != nil {
+		// Log error but don't fail
+	}
+}
+
 // minc increments a prometheus.Counter if it is non-nil
 func minc(counter prometheus.Counter) {
 	if counter != nil {
@@ -128,5 +237,85 @@ func minc(counter prometheus.Counter) {
 func mset[T int | int64 | float64](gauge prometheus.Gauge, value T) {
 	if gauge != nil {
 		gauge.Set(float64(value))
+	}
+}
+
+// OpenTelemetry metric helper functions
+
+// recordMessagePublished records a message published event with OpenTelemetry metrics
+func recordMessagePublished(ctx context.Context, success bool, topic string, protocol string) {
+	if otelMessagesPublished != nil {
+		attrs := []attribute.KeyValue{
+			attribute.Bool("success", success),
+			attribute.String("topic", topic),
+		}
+		if protocol != "" {
+			attrs = append(attrs, attribute.String("protocol", protocol))
+		}
+		otelMessagesPublished.Add(ctx, 1, metric.WithAttributes(attrs...))
+	}
+}
+
+// recordMessagePublishLatency records message publish latency with OpenTelemetry metrics
+func recordMessagePublishLatency(ctx context.Context, durationMs int64, topic string) {
+	if otelMessagePublishLatency != nil {
+		otelMessagePublishLatency.Record(ctx, durationMs, metric.WithAttributes(
+			attribute.String("topic", topic),
+		))
+	}
+}
+
+// recordFirebasePublished records a Firebase notification event
+func recordFirebasePublished(ctx context.Context, success bool) {
+	if otelFirebasePublished != nil {
+		otelFirebasePublished.Add(ctx, 1, metric.WithAttributes(
+			attribute.Bool("success", success),
+		))
+	}
+}
+
+// recordEmailSent records an email notification event
+func recordEmailSent(ctx context.Context, success bool) {
+	if otelEmailsSent != nil {
+		otelEmailsSent.Add(ctx, 1, metric.WithAttributes(
+			attribute.Bool("success", success),
+		))
+	}
+}
+
+// recordCallMade records a phone call event
+func recordCallMade(ctx context.Context, success bool) {
+	if otelCallsMade != nil {
+		otelCallsMade.Add(ctx, 1, metric.WithAttributes(
+			attribute.Bool("success", success),
+		))
+	}
+}
+
+// recordSubscriptionChange records subscription count changes
+func recordSubscriptionChange(ctx context.Context, delta int64, topic string) {
+	if otelSubscriptions != nil {
+		otelSubscriptions.Add(ctx, delta, metric.WithAttributes(
+			attribute.String("topic", topic),
+		))
+	}
+}
+
+// recordConnectionChange records active connection count changes
+func recordConnectionChange(ctx context.Context, delta int64, connectionType string) {
+	if otelActiveConnections != nil {
+		otelActiveConnections.Add(ctx, delta, metric.WithAttributes(
+			attribute.String("type", connectionType),
+		))
+	}
+}
+
+// recordCacheOperation records cache operations
+func recordCacheOperation(ctx context.Context, operation string, success bool) {
+	if otelCacheOperations != nil {
+		otelCacheOperations.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("operation", operation),
+			attribute.Bool("success", success),
+		))
 	}
 }

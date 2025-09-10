@@ -1,3 +1,4 @@
+SHELL := /bin/bash
 MAKEFLAGS := --jobs=1
 PYTHON := python3
 PIP := pip3
@@ -249,22 +250,22 @@ cli-build-results:
 check: test web-fmt-check fmt-check vet web-lint lint staticcheck
 
 test: .PHONY
-	go test $(shell go list ./... | grep -vE 'ntfy/(test|examples|tools)')
+	go test $$(go list ./... | grep -v -E 'ntfy/(test|examples|tools)')
 
 testv: .PHONY
-	go test -v $(shell go list ./... | grep -vE 'ntfy/(test|examples|tools)')
+	go test -v $$(go list ./... | grep -v -E 'ntfy/(test|examples|tools)')
 
 race: .PHONY
-	go test -v -race $(shell go list ./... | grep -vE 'ntfy/(test|examples|tools)')
+	go test -v -race $$(go list ./... | grep -v -E 'ntfy/(test|examples|tools)')
 
 coverage:
 	mkdir -p build/coverage
-	go test -v -race -coverprofile=build/coverage/coverage.txt -covermode=atomic $(shell go list ./... | grep -vE 'ntfy/(test|examples|tools)')
+	go test -v -race -coverprofile=build/coverage/coverage.txt -covermode=atomic $$(go list ./... | grep -v -E 'ntfy/(test|examples|tools)')
 	go tool cover -func build/coverage/coverage.txt
 
 coverage-html:
 	mkdir -p build/coverage
-	go test -race -coverprofile=build/coverage/coverage.txt -covermode=atomic $(shell go list ./... | grep -vE 'ntfy/(test|examples|tools)')
+	go test -race -coverprofile=build/coverage/coverage.txt -covermode=atomic $$(go list ./... | grep -v -E 'ntfy/(test|examples|tools)')
 	go tool cover -html build/coverage/coverage.txt
 
 coverage-upload:

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/urfave/cli/v2"
 	"heckel.io/ntfy/v2/cmd"
+	"heckel.io/ntfy/v2/otel"
 	"os"
 	"runtime"
 )
@@ -16,7 +17,7 @@ var (
 
 func main() {
 	// Initialize OpenTelemetry instrumentation
-	shutdown := setupInstrumentation("ntfy")
+	shutdown := otel.SetupInstrumentation("ntfy")
 	defer shutdown()
 
 	cli.AppHelpTemplate += fmt.Sprintf(`

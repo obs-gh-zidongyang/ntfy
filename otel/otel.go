@@ -1,11 +1,4 @@
-// DUPLICATE FILE - DISABLED TO FIX COMPILATION ERROR
-// This file is a duplicate of otel/otel.go and causes package conflicts.
-// The main.go imports "heckel.io/ntfy/v2/otel" package, but this file has "package main"
-// which creates function name conflicts. The correct implementation is in otel/otel.go.
-//
-// Disabled by changing package name to prevent compilation errors.
-
-package main_DISABLED_DUPLICATE
+package otel
 
 import (
 	"context"
@@ -135,9 +128,9 @@ func setupLogging(ctx context.Context, res *resource.Resource, otlpEndpoint, ser
 	return lp, nil
 }
 
-// setupInstrumentation initializes OpenTelemetry with tracing, metrics, and logging.
+// SetupInstrumentation initializes OpenTelemetry with tracing, metrics, and logging.
 // Returns a cleanup function that should be called before application shutdown.
-func setupInstrumentation(serviceName string) func() {
+func SetupInstrumentation(serviceName string) func() {
 	ctx := context.Background()
 
 	// Get OTLP endpoint from environment or use default
